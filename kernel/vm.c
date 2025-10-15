@@ -7,6 +7,13 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+
+// Forward declarations for page replacement (Phase 3)
+static int handle_page_replacement(void);
+static void write_to_swap(struct proc *p, uint64 va, int slot);
+static void read_from_swap(struct proc *p, uint64 va, int slot, uint64 pa);
 
 /*
  * the kernel's page table.
@@ -235,6 +242,34 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
+  }
+  return newsz;
+}
+
+// Lazily grow user memory from oldsz to newsz by creating page table
+// entries marked as PTE_LAZY without allocating physical memory.
+// Returns newsz on success, 0 on failure.
+uint64
+uvmlazygrow(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if(newsz < oldsz)
+    return oldsz;
+
+  oldsz = PGROUNDUP(oldsz);
+  for(a = oldsz; a < newsz; a += PGSIZE){
+    // Create PTE without allocating physical memory
+    if((pte = walk(pagetable, a, 1)) == 0){
+      // Failed to create page table entry
+      return 0;
+    }
+    if(*pte & PTE_V)
+      panic("uvmlazygrow: page already mapped");
+    
+    // Mark as lazy (not valid, but user-accessible with permissions)
+    *pte = PTE_U | PTE_LAZY | (xperm & (PTE_R | PTE_W | PTE_X));
   }
   return newsz;
 }
@@ -482,5 +517,462 @@ ismapped(pagetable_t pagetable, uint64 va)
   if (*pte & PTE_V){
     return 1;
   }
+  return 0;
+}
+
+// Handle page fault for text/data segments - load from executable
+void
+handle_exec_fault(uint64 va)
+{
+  struct proc *p = myproc();
+  char *mem;
+  pte_t *pte;
+  uint64 file_offset = 0;
+  int n;
+  int found = 0;
+  
+  va = PGROUNDDOWN(va);
+  
+  // Allocate physical page
+  mem = kalloc();
+  if (mem == 0) {
+    // Memory full - trigger page replacement (Phase 3)
+    if(handle_page_replacement() < 0) {
+      panic("handle_exec_fault: page replacement failed");
+    }
+    mem = kalloc();
+    if(mem == 0) {
+      panic("handle_exec_fault: kalloc failed after replacement");
+    }
+  }
+  
+  // Zero-fill first (in case we don't read a full page)
+  memset(mem, 0, PGSIZE);
+  
+  // Need to find which ELF segment this VA belongs to by reading ELF headers
+  struct elfhdr elf;
+  struct proghdr ph;
+  int i, off;
+  
+  begin_op();
+  ilock(p->exec_inode);
+  
+  // Read ELF header
+  if(readi(p->exec_inode, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf)) {
+    iunlock(p->exec_inode);
+    end_op();
+    kfree(mem);
+    panic("handle_exec_fault: failed to read ELF header");
+  }
+  
+  // Find the program header that contains this virtual address
+  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+    if(readi(p->exec_inode, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph)) {
+      iunlock(p->exec_inode);
+      end_op();
+      kfree(mem);
+      panic("handle_exec_fault: failed to read program header");
+    }
+    
+    if(ph.type != ELF_PROG_LOAD)
+      continue;
+    
+    // Check if VA is in this segment
+    if(va >= ph.vaddr && va < ph.vaddr + ph.memsz) {
+      found = 1;
+      
+      // Calculate offset in this segment
+      uint64 seg_offset = va - ph.vaddr;
+      
+      // Calculate file offset
+      file_offset = ph.off + seg_offset;
+      
+      // Determine how much to read from file
+      uint64 bytes_in_file = (seg_offset < ph.filesz) ? (ph.filesz - seg_offset) : 0;
+      
+      // Read from file (only if there's data in the file for this part)
+      if(bytes_in_file > 0) {
+        n = (bytes_in_file > PGSIZE) ? PGSIZE : bytes_in_file;
+        if(readi(p->exec_inode, 0, (uint64)mem, file_offset, n) != n) {
+          iunlock(p->exec_inode);
+          end_op();
+          kfree(mem);
+          panic("handle_exec_fault: failed to read segment data");
+        }
+      }
+      // Rest is already zeroed from memset above
+      
+      break;
+    }
+  }
+  
+  iunlock(p->exec_inode);
+  end_op();
+  
+  if(!found) {
+    kfree(mem);
+    panic("handle_exec_fault: VA not in any ELF segment");
+  }
+  
+  // Get PTE
+  pte = walk(p->pagetable, va, 0);
+  if (pte == 0) {
+    kfree(mem);
+    panic("handle_exec_fault: walk failed");
+  }
+  
+  // Determine permissions based on segment
+  int perm = PTE_U;
+  if (va >= p->text_start && va < p->text_end) {
+    // Text segment: readable and executable (not writable)
+    perm |= PTE_R | PTE_X;
+  } else {
+    // Data segment: initially read-only for dirty tracking (Phase 5)
+    // Will become writable on first write fault
+    perm |= PTE_R;
+  }
+  
+  // Map the page
+  *pte = PA2PTE((uint64)mem) | perm | PTE_V;
+  
+  // Add to resident set
+  add_to_resident_set(p, va, p->next_fifo_seq++, 0, -1);
+  
+  // Log
+  printf("[pid %d] LOADEXEC va=0x%lx\n", p->pid, va);
+  printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, p->next_fifo_seq - 1);
+}
+
+// Handle page fault for heap - allocate and zero-fill
+void
+handle_heap_fault(uint64 va)
+{
+  struct proc *p = myproc();
+  char *mem;
+  pte_t *pte;
+  
+  va = PGROUNDDOWN(va);
+  
+  // Allocate physical page
+  mem = kalloc();
+  if (mem == 0) {
+    // Memory full - trigger page replacement (Phase 3)
+    if(handle_page_replacement() < 0) {
+      panic("handle_heap_fault: page replacement failed");
+    }
+    mem = kalloc();
+    if(mem == 0) {
+      panic("handle_heap_fault: kalloc failed after replacement");
+    }
+  }
+  
+  // Zero-fill
+  memset(mem, 0, PGSIZE);
+  
+  // Get PTE
+  pte = walk(p->pagetable, va, 0);
+  if (pte == 0) {
+    kfree(mem);
+    panic("handle_heap_fault: walk failed");
+  }
+  
+  // Map page as read-only initially for dirty tracking (Phase 5)
+  // Will become writable on first write fault
+  *pte = PA2PTE((uint64)mem) | PTE_V | PTE_U | PTE_R;
+  
+  // Add to resident set (initially clean)
+  add_to_resident_set(p, va, p->next_fifo_seq++, 0, -1);
+  
+  // Log
+  printf("[pid %d] ALLOC va=0x%lx\n", p->pid, va);
+  printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, p->next_fifo_seq - 1);
+}
+
+// Handle page fault for stack - validate and allocate
+void
+handle_stack_fault(uint64 va)
+{
+  struct proc *p = myproc();
+  uint64 sp = p->trapframe->sp;
+  
+  va = PGROUNDDOWN(va);
+  
+  // Check if within one page below SP and below stack top
+  if (va < sp - PGSIZE || va >= p->stack_top) {
+    // Invalid stack access
+    printf("[pid %d] KILL invalid-stack-access va=0x%lx sp=0x%lx\n", 
+           p->pid, va, sp);
+    setkilled(p);
+    return;
+  }
+  
+  // Valid stack access - same as heap allocation
+  handle_heap_fault(va);
+}
+
+// Mark page as dirty in resident set (Phase 5)
+void
+mark_page_dirty(struct proc *p, uint64 va)
+{
+  int idx;
+  va = PGROUNDDOWN(va);
+  
+  if (find_resident_page(p, va, &idx)) {
+    p->resident_pages[idx].is_dirty = 1;
+  }
+}
+
+// Select FIFO victim - page with lowest sequence number
+// Returns virtual address of victim page
+static uint64
+select_fifo_victim(struct proc *p)
+{
+  if (p->num_resident == 0) {
+    panic("select_fifo_victim: no resident pages to evict");
+  }
+  
+  // Find page with lowest sequence number (oldest page)
+  int victim_idx = 0;
+  uint min_seq = p->resident_pages[0].seq;
+  
+  for (int i = 1; i < p->num_resident; i++) {
+    // Handle wraparound: (int)(seq1 - seq2) < 0 means seq1 is older
+    if ((int)(p->resident_pages[i].seq - min_seq) < 0) {
+      min_seq = p->resident_pages[i].seq;
+      victim_idx = i;
+    }
+  }
+  
+  return p->resident_pages[victim_idx].va;
+}
+
+// Write page contents to swap file at specified slot (Phase 4.3)
+// va: virtual address of page to swap out
+// slot: swap slot number (0-1023)
+static void
+write_to_swap(struct proc *p, uint64 va, int slot)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint64 offset;
+  int n;
+  
+  va = PGROUNDDOWN(va);
+  
+  // Get PTE and physical address
+  pte = walk(p->pagetable, va, 0);
+  if (pte == 0 || (*pte & PTE_V) == 0) {
+    panic("write_to_swap: page not valid");
+  }
+  
+  pa = PTE2PA(*pte);
+  
+  // Calculate offset in swap file (slot * page size)
+  offset = slot * PGSIZE;
+  
+  // Write page to swap file
+  begin_op();
+  ilock(p->swapfile->ip);
+  
+  // Write PGSIZE bytes from physical address to swap file at offset
+  if((n = writei(p->swapfile->ip, 0, pa, offset, PGSIZE)) != PGSIZE) {
+    iunlock(p->swapfile->ip);
+    end_op();
+    panic("write_to_swap: writei failed");
+  }
+  
+  iunlock(p->swapfile->ip);
+  end_op();
+}
+
+// Read page contents from swap file at specified slot (Phase 4.4)
+// va: virtual address of page to swap in
+// slot: swap slot number (0-1023)
+// pa: physical address where to load the page
+static void
+read_from_swap(struct proc *p, uint64 va, int slot, uint64 pa)
+{
+  uint64 offset;
+  int n;
+  
+  va = PGROUNDDOWN(va);
+  
+  // Calculate offset in swap file (slot * page size)
+  offset = slot * PGSIZE;
+  
+  // Read page from swap file
+  begin_op();
+  ilock(p->swapfile->ip);
+  
+  // Read PGSIZE bytes from swap file at offset to physical address
+  if((n = readi(p->swapfile->ip, 0, pa, offset, PGSIZE)) != PGSIZE) {
+    iunlock(p->swapfile->ip);
+    end_op();
+    panic("read_from_swap: readi failed");
+  }
+  
+  iunlock(p->swapfile->ip);
+  end_op();
+}
+
+// Handle swap-in operation (Phase 4.4)
+// Called when a page fault occurs on a swapped-out page
+void
+handle_swap_fault(uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  char *mem;
+  int slot;
+  
+  va = PGROUNDDOWN(va);
+  
+  // Get PTE to extract swap slot number
+  pte = walk(p->pagetable, va, 0);
+  if (pte == 0 || (*pte & PTE_SWAPPED) == 0) {
+    panic("handle_swap_fault: page not swapped");
+  }
+  
+  // Extract slot number from PTE (stored in bits 10 and above)
+  slot = (*pte >> 10) & 0x3FF;  // 0x3FF = 1023, max slot number
+  
+  // Allocate physical page
+  mem = kalloc();
+  if (mem == 0) {
+    // Memory full - trigger page replacement
+    if(handle_page_replacement() < 0) {
+      panic("handle_swap_fault: page replacement failed");
+    }
+    mem = kalloc();
+    if(mem == 0) {
+      panic("handle_swap_fault: kalloc failed after replacement");
+    }
+  }
+  
+  // Read page from swap file
+  read_from_swap(p, va, slot, (uint64)mem);
+  
+  // Free the swap slot
+  free_swap_slot(p, slot);
+  
+  // Determine permissions based on address range (Phase 5)
+  // Initially map as read-only for dirty tracking
+  int perm = PTE_U | PTE_V;
+  if (va >= p->text_start && va < p->text_end) {
+    // Text segment: readable and executable (not writable)
+    perm |= PTE_R | PTE_X;
+  } else {
+    // Data/heap/stack: readable only, will become writable on first write
+    perm |= PTE_R;
+  }
+  
+  // Map page into page table
+  *pte = PA2PTE((uint64)mem) | perm;
+  
+  // Add to resident set with new FIFO sequence
+  add_to_resident_set(p, va, p->next_fifo_seq++, 0, -1);
+  
+  // Log swap-in
+  printf("[pid %d] SWAPIN va=0x%lx slot=%d\n", p->pid, va, slot);
+  printf("[pid %d] RESIDENT va=0x%lx seq=%d\n", p->pid, va, p->next_fifo_seq - 1);
+}
+
+// Handle page replacement when memory is full (Phase 3)
+// Returns 0 on success, -1 on failure
+static int
+handle_page_replacement(void)
+{
+  struct proc *p = myproc();
+  pte_t *pte;
+  uint64 pa;
+  
+  // Log memory full
+  printf("[pid %d] MEMFULL\n", p->pid);
+  
+  // Check if there are any resident pages to evict
+  if (p->num_resident == 0) {
+    printf("[pid %d] KILL no-pages-to-evict\n", p->pid);
+    setkilled(p);
+    return -1;
+  }
+  
+  // Select victim using FIFO
+  uint64 victim_va = select_fifo_victim(p);
+  
+  // Find victim in resident set to get its metadata
+  int idx;
+  if (!find_resident_page(p, victim_va, &idx)) {
+    panic("handle_page_replacement: victim not in resident set");
+  }
+  
+  uint victim_seq = p->resident_pages[idx].seq;
+  int is_dirty = p->resident_pages[idx].is_dirty;
+  
+  // Log victim selection
+  printf("[pid %d] VICTIM va=0x%lx seq=%d algo=FIFO\n",
+         p->pid, victim_va, victim_seq);
+  
+  // Log eviction with state
+  printf("[pid %d] EVICT va=0x%lx state=%s\n",
+         p->pid, victim_va, is_dirty ? "dirty" : "clean");
+  
+  // Get PTE and physical address before eviction
+  pte = walk(p->pagetable, victim_va, 0);
+  if (pte == 0 || (*pte & PTE_V) == 0) {
+    panic("handle_page_replacement: victim page not valid");
+  }
+  pa = PTE2PA(*pte);
+  
+  // Handle eviction based on dirty state
+  if (is_dirty) {
+    // Dirty page needs to be swapped out (Phase 4)
+    if (p->swapfile == 0) {
+      // Swap not initialized - cannot swap out
+      printf("[pid %d] KILL swap-not-initialized\n", p->pid);
+      setkilled(p);
+      return -1;
+    }
+    
+    // Allocate a swap slot
+    int slot = allocate_swap_slot(p);
+    if (slot < 0) {
+      // Swap full - no free slots
+      printf("[pid %d] SWAPFULL\n", p->pid);
+      printf("[pid %d] KILL swap-exhausted\n", p->pid);
+      setkilled(p);
+      return -1;
+    }
+    
+    // Write page to swap file
+    write_to_swap(p, victim_va, slot);
+    
+    // Log swap-out
+    printf("[pid %d] SWAPOUT va=0x%lx slot=%d\n", p->pid, victim_va, slot);
+    
+    // Mark PTE as swapped (store slot number in PTE)
+    // Clear PTE_V but set PTE_SWAPPED and store slot in upper bits
+    *pte = (slot << 10) | PTE_SWAPPED | PTE_U;
+    
+  } else {
+    // Clean page - just discard it
+    printf("[pid %d] DISCARD va=0x%lx\n", p->pid, victim_va);
+    
+    // Mark PTE as not present but lazy (can be reloaded from exec or re-allocated)
+    // Determine if this is a text/data page or heap/stack page
+    if (victim_va >= p->text_start && victim_va < p->data_end) {
+      // Text/data - can be reloaded from executable
+      *pte = PTE_U | PTE_LAZY;
+    } else {
+      // Heap/stack - mark as lazy
+      *pte = PTE_U | PTE_LAZY | PTE_R | PTE_W;
+    }
+  }
+  
+  // Free the physical page
+  kfree((void *)pa);
+  
+  // Remove from resident set
+  remove_from_resident_set(p, victim_va);
+  
   return 0;
 }

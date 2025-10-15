@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "memstat.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
@@ -161,6 +165,14 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  
+  // Clean up demand paging state
+  // Note: exec_inode and swapfile are cleaned up in exit() before
+  // process lock is acquired, to avoid lock ordering issues.
+  p->exec_inode = 0;
+  p->swapfile = 0;
+  p->swappath[0] = 0;
+  
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -241,13 +253,16 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    // Heap growth - use lazy allocation
     if(sz + n > TRAPFRAME) {
       return -1;
     }
-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+    // Use lazy allocation instead of eager allocation
+    if((sz = uvmlazygrow(p->pagetable, sz, sz + n, PTE_W)) == 0) {
       return -1;
     }
   } else if(n < 0){
+    // Heap shrinking - free pages and update swap
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
@@ -275,6 +290,29 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  // Copy memory layout fields for demand paging
+  np->text_start = p->text_start;
+  np->text_end = p->text_end;
+  np->data_start = p->data_start;
+  np->data_end = p->data_end;
+  np->heap_start = p->heap_start;
+  np->stack_top = p->stack_top;
+  np->next_fifo_seq = p->next_fifo_seq;
+  np->num_resident = p->num_resident;
+  
+  // Copy resident set information
+  for(int j = 0; j < MAX_PAGES_INFO; j++) {
+    np->resident_pages[j] = p->resident_pages[j];
+  }
+  
+  // Copy exec inode reference
+  if(p->exec_inode) {
+    np->exec_inode = p->exec_inode;
+    idup(np->exec_inode);  // Increment reference count
+  } else {
+    np->exec_inode = 0;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -344,6 +382,17 @@ kexit(int status)
   iput(p->cwd);
   end_op();
   p->cwd = 0;
+  
+  // Clean up exec inode
+  if(p->exec_inode) {
+    begin_op();
+    iput(p->exec_inode);
+    end_op();
+    p->exec_inode = 0;
+  }
+  
+  // Clean up swap file (Phase 4.5)
+  cleanup_swap(p);
 
   acquire(&wait_lock);
 
@@ -686,5 +735,170 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+// Add page to resident set
+void
+add_to_resident_set(struct proc *p, uint64 va, uint seq, int is_dirty, int swap_slot)
+{
+  if (p->num_resident >= MAX_PAGES_INFO) {
+    panic("resident set overflow");
+  }
+  
+  va = PGROUNDDOWN(va);
+  p->resident_pages[p->num_resident].va = va;
+  p->resident_pages[p->num_resident].seq = seq;
+  p->resident_pages[p->num_resident].is_dirty = is_dirty;
+  p->resident_pages[p->num_resident].swap_slot = swap_slot;
+  p->num_resident++;
+}
+
+// Remove page from resident set
+void
+remove_from_resident_set(struct proc *p, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  for (int i = 0; i < p->num_resident; i++) {
+    if (p->resident_pages[i].va == va) {
+      // Shift remaining entries
+      for (int j = i; j < p->num_resident - 1; j++) {
+        p->resident_pages[j] = p->resident_pages[j + 1];
+      }
+      p->num_resident--;
+      return;
+    }
+  }
+}
+
+// Find page in resident set
+int
+find_resident_page(struct proc *p, uint64 va, int *index)
+{
+  va = PGROUNDDOWN(va);
+  for (int i = 0; i < p->num_resident; i++) {
+    if (p->resident_pages[i].va == va) {
+      if (index) *index = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Allocate a free swap slot
+// Returns slot number (0-1023) on success, -1 if swap is full
+int
+allocate_swap_slot(struct proc *p)
+{
+  // Iterate through all 1024 possible slots
+  for (int i = 0; i < 1024; i++) {
+    int byte = i / 32;  // Which uint32 in the bitmap array
+    int bit = i % 32;   // Which bit within that uint32
+    
+    // Check if this slot is free (bit is 0)
+    if (!(p->swap_bitmap[byte] & (1 << bit))) {
+      // Mark slot as used (set bit to 1)
+      p->swap_bitmap[byte] |= (1 << bit);
+      return i;
+    }
+  }
+  
+  // No free slots available
+  return -1;
+}
+
+// Free a swap slot
+// Marks the specified slot as available for reuse
+void
+free_swap_slot(struct proc *p, int slot)
+{
+  if (slot < 0 || slot >= 1024) {
+    panic("free_swap_slot: invalid slot number");
+  }
+  
+  int byte = slot / 32;
+  int bit = slot % 32;
+  
+  // Mark slot as free (clear bit to 0)
+  p->swap_bitmap[byte] &= ~(1 << bit);
+}
+
+// Check if a swap slot is currently in use
+// Returns 1 if used, 0 if free
+int
+is_slot_used(struct proc *p, int slot)
+{
+  if (slot < 0 || slot >= 1024) {
+    return 0;  // Invalid slot is considered "not used"
+  }
+  
+  int byte = slot / 32;
+  int bit = slot % 32;
+  
+  // Check if bit is set (1 = used, 0 = free)
+  return (p->swap_bitmap[byte] & (1 << bit)) != 0;
+}
+
+// Clean up swap file on process exit (Phase 4.5)
+// Counts used slots, logs cleanup, closes file, and deletes from filesystem
+void
+cleanup_swap(struct proc *p)
+{
+  if (p->swapfile == 0) {
+    return;  // No swap file to clean up
+  }
+  
+  // Count how many swap slots are currently in use
+  int freed_slots = 0;
+  for (int i = 0; i < 1024; i++) {
+    if (is_slot_used(p, i)) {
+      freed_slots++;
+    }
+  }
+  
+  // Log swap cleanup with number of freed slots
+  printf("[pid %d] SWAPCLEANUP freed_slots=%d\n", p->pid, freed_slots);
+  
+  // Close the swap file handle
+  fileclose(p->swapfile);
+  p->swapfile = 0;
+  
+  // Delete the swap file from the filesystem
+  // We need to manually delete the file since there's no kernel-level unlink
+  // that takes a path directly. We'll use the file system primitives.
+  if (p->swappath[0] != 0) {
+    struct inode *dp, *ip;
+    char name[DIRSIZ];
+    uint off;
+    struct dirent de;
+    
+    begin_op();
+    
+    // Get parent directory (root in this case, since path is /pgswpXXXXX)
+    if ((dp = nameiparent(p->swappath, name)) != 0) {
+      ilock(dp);
+      
+      // Look up the swap file in the directory
+      if ((ip = dirlookup(dp, name, &off)) != 0) {
+        ilock(ip);
+        
+        // Clear the directory entry
+        memset(&de, 0, sizeof(de));
+        if (writei(dp, 0, (uint64)&de, off, sizeof(de)) == sizeof(de)) {
+          // Successfully removed directory entry
+          ip->nlink--;
+          iupdate(ip);
+        }
+        
+        iunlockput(ip);
+      }
+      
+      iunlockput(dp);
+    }
+    
+    end_op();
+    
+    // Clear the swap path
+    p->swappath[0] = 0;
   }
 }

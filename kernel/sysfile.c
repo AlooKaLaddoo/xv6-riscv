@@ -242,7 +242,9 @@ bad:
   return -1;
 }
 
-static struct inode*
+// Create a file or directory at the given path
+// Returns locked inode on success, 0 on failure
+struct inode*
 create(char *path, short type, short major, short minor)
 {
   struct inode *ip, *dp;

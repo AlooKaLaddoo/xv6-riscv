@@ -55,6 +55,9 @@ int             writei(struct inode*, int, uint64, uint, uint);
 void            itrunc(struct inode*);
 void            ireclaim(int);
 
+// sysfile.c
+struct inode*   create(char*, short, short, short);
+
 // kalloc.c
 void*           kalloc(void);
 void            kfree(void *);
@@ -101,6 +104,13 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+void            add_to_resident_set(struct proc*, uint64, uint, int, int);
+void            remove_from_resident_set(struct proc*, uint64);
+int             find_resident_page(struct proc*, uint64, int*);
+int             allocate_swap_slot(struct proc*);
+void            free_swap_slot(struct proc*, int);
+int             is_slot_used(struct proc*, int);
+void            cleanup_swap(struct proc*);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -157,6 +167,7 @@ void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
 uint64          uvmalloc(pagetable_t, uint64, uint64, int);
+uint64          uvmlazygrow(pagetable_t, uint64, uint64, int);
 uint64          uvmdealloc(pagetable_t, uint64, uint64);
 int             uvmcopy(pagetable_t, pagetable_t, uint64);
 void            uvmfree(pagetable_t, uint64);
@@ -169,6 +180,11 @@ int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, int);
+void            handle_exec_fault(uint64);
+void            handle_heap_fault(uint64);
+void            handle_stack_fault(uint64);
+void            handle_swap_fault(uint64);
+void            mark_page_dirty(struct proc*, uint64);
 
 // plic.c
 void            plicinit(void);

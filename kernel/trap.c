@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "memstat.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -27,6 +28,173 @@ void
 trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
+}
+
+// Helper function to check if a page is swapped
+int
+is_swapped_page(struct proc *p, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  pte_t *pte = walk(p->pagetable, va, 0);
+  if (pte && (*pte & PTE_SWAPPED)) {
+    return 1;
+  }
+  return 0;
+}
+
+// Step 2.5: Check if a page fault address is in a valid range
+// Valid ranges are:
+// - Text segment [text_start, text_end)
+// - Data segment [data_start, data_end)
+// - Heap [heap_start, sz)
+// - Stack (one page below SP up to stack_top)
+// - Swapped pages
+int
+is_valid_access(struct proc *p, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  
+  // Check text segment
+  if (va >= p->text_start && va < p->text_end) return 1;
+  
+  // Check data segment
+  if (va >= p->data_start && va < p->data_end) return 1;
+  
+  // Check heap (up to process size)
+  if (va >= p->heap_start && va < p->sz) return 1;
+  
+  // Check stack (one page below SP up to stack_top)
+  uint64 sp = p->trapframe->sp;
+  if (va >= sp - PGSIZE && va < p->stack_top) return 1;
+  
+  // Check if swapped
+  if (is_swapped_page(p, va)) return 1;
+  
+  return 0;
+}
+
+// Classify the cause of a page fault
+char*
+classify_fault_cause(struct proc *p, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  
+  // Check if swapped
+  if (is_swapped_page(p, va)) {
+    return "swap";
+  }
+  
+  // Check text segment
+  if (va >= p->text_start && va < p->text_end) {
+    return "exec";
+  }
+  
+  // Check data segment
+  if (va >= p->data_start && va < p->data_end) {
+    return "exec";
+  }
+  
+  // Check heap
+  if (va >= p->heap_start && va < p->sz) {
+    return "heap";
+  }
+  
+  // Check stack
+  uint64 sp = p->trapframe->sp;
+  if (va >= sp - PGSIZE && va < p->stack_top) {
+    return "stack";
+  }
+  
+  return "invalid";
+}
+
+// Handle page fault (Steps 2.3, 2.4, 2.5, Phase 5)
+void
+handle_page_fault(struct proc *p, uint64 va, uint64 scause)
+{
+  va = PGROUNDDOWN(va);
+  
+  // Phase 5: Check for write fault on read-only page (dirty tracking)
+  // This happens when a page is valid but not writable (first write to clean page)
+  if (scause == 15) {  // Store/write page fault
+    pte_t *pte = walk(p->pagetable, va, 0);
+    
+    // If page is valid but not writable, this is first write - mark dirty
+    if (pte && (*pte & PTE_V) && !(*pte & PTE_W)) {
+      // Check if this is a legitimate writable region (not text segment)
+      if (!(va >= p->text_start && va < p->text_end)) {
+        // Mark page as dirty
+        mark_page_dirty(p, va);
+        
+        // Make page writable
+        *pte |= PTE_W;
+        
+        // Flush TLB for this page
+        sfence_vma();
+        
+        // Continue execution - no need to log, this is transparent
+        return;
+      }
+      // If trying to write to text segment, fall through to error handling
+    }
+  }
+  
+  // Determine access type (Step 2.3)
+  char *access_type;
+  if (scause == 12) {
+    access_type = "exec";
+  } else if (scause == 13) {
+    access_type = "read";
+  } else {  // scause == 15
+    access_type = "write";
+  }
+  
+  // Classify fault cause (Step 2.3)
+  char *cause = classify_fault_cause(p, va);
+  
+  // Log page fault (Step 2.3)
+  printf("[pid %d] PAGEFAULT va=0x%lx access=%s cause=%s\n",
+         p->pid, va, access_type, cause);
+  
+  // Step 2.5: Handle invalid page faults
+  // Check if access is to a valid address range
+  if (!is_valid_access(p, va)) {
+    // Invalid access - log and terminate process
+    printf("[pid %d] KILL invalid-access va=0x%lx access=%s\n",
+           p->pid, va, access_type);
+    setkilled(p);
+    return;
+  }
+  
+  // Step 2.5: Check for invalid execute access to non-executable regions
+  if (scause == 12) {  // Instruction page fault
+    // Only text segment can be executed
+    if (!(va >= p->text_start && va < p->text_end)) {
+      printf("[pid %d] KILL invalid-exec va=0x%lx\n", p->pid, va);
+      setkilled(p);
+      return;
+    }
+  }
+  
+  // Call appropriate handler based on cause
+  if (is_swapped_page(p, va)) {
+    // Swapped page - swap in from disk (Phase 4.4)
+    handle_swap_fault(va);
+  } else if ((va >= p->text_start && va < p->text_end) || 
+             (va >= p->data_start && va < p->data_end)) {
+    // Text or data segment - load from executable
+    handle_exec_fault(va);
+  } else if (va >= p->heap_start && va < p->sz) {
+    // Heap - allocate and zero-fill
+    handle_heap_fault(va);
+  } else if (va >= p->trapframe->sp - PGSIZE && va < p->stack_top) {
+    // Stack - validate and allocate
+    handle_stack_fault(va);
+  } else {
+    // Should not reach here if is_valid_access works correctly
+    printf("[pid %d] KILL unexpected-fault va=0x%lx\n", p->pid, va);
+    setkilled(p);
+  }
 }
 
 //
@@ -68,9 +236,10 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if((r_scause() == 15 || r_scause() == 13) &&
-            vmfault(p->pagetable, r_stval(), (r_scause() == 13)? 1 : 0) != 0) {
-    // page fault on lazily-allocated page
+  } else if(r_scause() == 12 || r_scause() == 13 || r_scause() == 15) {
+    // Page fault: 12 = instruction, 13 = load, 15 = store
+    uint64 va = r_stval();
+    handle_page_fault(p, va, r_scause());
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());

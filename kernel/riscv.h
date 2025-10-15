@@ -361,6 +361,10 @@ typedef uint64 *pagetable_t; // 512 PTEs
 #define PTE_X (1L << 3)
 #define PTE_U (1L << 4) // user can access
 
+// Custom PTE flags for demand paging (using RSW bits - Reserved for Software)
+#define PTE_SWAPPED (1L << 8) // Page is swapped out to disk
+#define PTE_LAZY (1L << 9)    // Page is lazily allocated (not yet resident)
+
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
 

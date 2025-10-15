@@ -1,3 +1,6 @@
+// Include memstat header for MAX_PAGES_INFO constant
+#include "memstat.h"
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -104,4 +107,33 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // Demand paging fields - PagedOut Inc.
+  uint64 text_start;           // Start of text segment
+  uint64 text_end;             // End of text segment
+  uint64 data_start;           // Start of data segment
+  uint64 data_end;             // End of data segment
+  uint64 heap_start;           // Start of heap
+  uint64 stack_top;            // Top of stack (MAXVA)
+  
+  // FIFO tracking
+  uint next_fifo_seq;          // Next sequence number to assign
+  
+  // Swap file management
+  struct file *swapfile;       // Swap file handle
+  char swappath[16];           // Path like "/pgswp00123"
+  uint swap_bitmap[32];        // 1024 bits for 1024 slots (4MB)
+  
+  // Resident set tracking
+  struct {
+    uint64 va;                 // Virtual address
+    uint seq;                  // FIFO sequence number
+    int is_dirty;              // Dirty bit
+    int swap_slot;             // Swap slot if swapped out (-1 if not)
+  } resident_pages[MAX_PAGES_INFO];
+  int num_resident;            // Number of resident pages
+  
+  // Executable file for loading pages on demand
+  struct inode *exec_inode;    // Reference to executable inode
+  uint64 exec_offset;          // Offset in executable (if needed)
 };
