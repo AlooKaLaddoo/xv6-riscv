@@ -220,6 +220,7 @@ kexec(char *path, char **argv)
   
   // Initialize FIFO sequence counter
   p->next_fifo_seq = 0;
+  p->clock_hand = 0;  // Initialize Clock algorithm hand
   
   // Initialize resident set tracking
   p->num_resident = 0;

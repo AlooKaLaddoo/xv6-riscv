@@ -299,6 +299,7 @@ kfork(void)
   np->heap_start = p->heap_start;
   np->stack_top = p->stack_top;
   np->next_fifo_seq = p->next_fifo_seq;
+  np->clock_hand = p->clock_hand;  // Copy Clock algorithm hand
   np->num_resident = p->num_resident;
   
   // Copy resident set information

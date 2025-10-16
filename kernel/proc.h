@@ -119,6 +119,9 @@ struct proc {
   // FIFO tracking
   uint next_fifo_seq;          // Next sequence number to assign
   
+  // Clock algorithm tracking (Bonus - Phase 8)
+  int clock_hand;              // Index for clock algorithm (0 to num_resident-1)
+  
   // Swap file management
   struct file *swapfile;       // Swap file handle
   char swappath[16];           // Path like "/pgswp00123"

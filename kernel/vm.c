@@ -10,6 +10,10 @@
 #include "sleeplock.h"
 #include "file.h"
 
+// Page replacement algorithm selection (Bonus Phase 8)
+// Comment out to use FIFO, uncomment to use Clock
+// #define USE_CLOCK_ALGORITHM
+
 // Forward declarations for page replacement (Phase 3)
 static int handle_page_replacement(void);
 static void write_to_swap(struct proc *p, uint64 va, int slot);
@@ -746,6 +750,56 @@ select_fifo_victim(struct proc *p)
   return p->resident_pages[victim_idx].va;
 }
 
+// Clock algorithm victim selection (Bonus Phase 8)
+// Uses second-chance algorithm with PTE_A (access bit)
+// Circular scan giving accessed pages a second chance
+static uint64 __attribute__((unused))
+select_clock_victim(struct proc *p)
+{
+  if (p->num_resident == 0) {
+    panic("select_clock_victim: no resident pages to evict");
+  }
+  
+  // Ensure clock_hand is within bounds
+  if (p->clock_hand >= p->num_resident) {
+    p->clock_hand = 0;
+  }
+  
+  int scanned = 0;  // Track how many pages we've scanned
+  int max_scans = p->num_resident * 2;  // Allow up to 2 full rotations
+  
+  // Circular scan with second-chance
+  while (scanned < max_scans) {
+    int current_idx = p->clock_hand;
+    
+    uint64 va = p->resident_pages[current_idx].va;
+    pte_t *pte = walk(p->pagetable, va, 0);
+    
+    if (pte == 0 || (*pte & PTE_V) == 0) {
+      panic("select_clock_victim: invalid PTE");
+    }
+    
+    // Check access bit (PTE_A)
+    if (*pte & PTE_A) {
+      // Give second chance: clear access bit and move on
+      *pte &= ~PTE_A;
+      p->clock_hand = (p->clock_hand + 1) % p->num_resident;
+      scanned++;
+    } else {
+      // Not accessed recently - this is our victim
+      // Update clock hand to next position for next eviction
+      p->clock_hand = (p->clock_hand + 1) % p->num_resident;
+      return va;
+    }
+  }
+  
+  // Safety: if all pages were accessed (shouldn't happen after 2 rotations)
+  // Return page at current clock hand
+  int victim_idx = p->clock_hand;
+  p->clock_hand = (p->clock_hand + 1) % p->num_resident;
+  return p->resident_pages[victim_idx].va;
+}
+
 // Write page contents to swap file at specified slot (Phase 4.3)
 // va: virtual address of page to swap out
 // slot: swap slot number (0-1023)
@@ -896,8 +950,14 @@ handle_page_replacement(void)
     return -1;
   }
   
-  // Select victim using FIFO
+  // Select victim using configured algorithm
+#ifdef USE_CLOCK_ALGORITHM
+  uint64 victim_va = select_clock_victim(p);
+  const char *algo_name = "CLOCK";
+#else
   uint64 victim_va = select_fifo_victim(p);
+  const char *algo_name = "FIFO";
+#endif
   
   // Find victim in resident set to get its metadata
   int idx;
@@ -909,8 +969,8 @@ handle_page_replacement(void)
   int is_dirty = p->resident_pages[idx].is_dirty;
   
   // Log victim selection
-  printf("[pid %d] VICTIM va=0x%lx seq=%d algo=FIFO\n",
-         p->pid, victim_va, victim_seq);
+  printf("[pid %d] VICTIM va=0x%lx seq=%d algo=%s\n",
+         p->pid, victim_va, victim_seq, algo_name);
   
   // Log eviction with state
   printf("[pid %d] EVICT va=0x%lx state=%s\n",
