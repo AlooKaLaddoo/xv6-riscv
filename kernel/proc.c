@@ -254,7 +254,8 @@ growproc(int n)
   sz = p->sz;
   if(n > 0){
     // Heap growth - use lazy allocation
-    if(sz + n > TRAPFRAME) {
+    // Limit process size to prevent unrealistic memory allocations
+    if(sz + n > MAXPROCSIZE || sz + n > TRAPFRAME) {
       return -1;
     }
     // Use lazy allocation instead of eager allocation
@@ -744,7 +745,11 @@ void
 add_to_resident_set(struct proc *p, uint64 va, uint seq, int is_dirty, int swap_slot)
 {
   if (p->num_resident >= MAX_PAGES_INFO) {
-    panic("resident set overflow");
+    // Resident set is full - this should not happen as page replacement
+    // should have been triggered before we get here, but handle gracefully
+    printf("[pid %d] WARNING: resident set full, cannot track page 0x%lx\n", p->pid, va);
+    // Don't panic, just don't add to tracking (page is still mapped)
+    return;
   }
   
   va = PGROUNDDOWN(va);

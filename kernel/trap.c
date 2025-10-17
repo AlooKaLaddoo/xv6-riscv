@@ -35,6 +35,12 @@ int
 is_swapped_page(struct proc *p, uint64 va)
 {
   va = PGROUNDDOWN(va);
+  
+  // Don't call walk() on invalid addresses (>= MAXVA or kernel addresses)
+  if (va >= MAXVA || va >= KERNBASE) {
+    return 0;
+  }
+  
   pte_t *pte = walk(p->pagetable, va, 0);
   if (pte && (*pte & PTE_SWAPPED)) {
     return 1;
@@ -53,6 +59,10 @@ int
 is_valid_access(struct proc *p, uint64 va)
 {
   va = PGROUNDDOWN(va);
+  
+  // Reject kernel addresses (>= MAXVA or >= KERNBASE)
+  // KERNBASE is 0x80000000 where kernel memory starts
+  if (va >= MAXVA || va >= KERNBASE) return 0;
   
   // Check text segment
   if (va >= p->text_start && va < p->text_end) return 1;
@@ -116,7 +126,7 @@ handle_page_fault(struct proc *p, uint64 va, uint64 scause)
   
   // Phase 5: Check for write fault on read-only page (dirty tracking)
   // This happens when a page is valid but not writable (first write to clean page)
-  if (scause == 15) {  // Store/write page fault
+  if (scause == 15 && va < MAXVA && va < KERNBASE) {  // Store/write page fault on valid address
     pte_t *pte = walk(p->pagetable, va, 0);
     
     // If page is valid but not writable, this is first write - mark dirty
@@ -171,6 +181,16 @@ handle_page_fault(struct proc *p, uint64 va, uint64 scause)
     // Only text segment can be executed
     if (!(va >= p->text_start && va < p->text_end)) {
       printf("[pid %d] KILL invalid-exec va=0x%lx\n", p->pid, va);
+      setkilled(p);
+      return;
+    }
+  }
+  
+  // Step 2.5: Check for invalid write access to read-only (text) segment
+  if (scause == 15) {  // Store/write page fault
+    // Cannot write to text segment
+    if (va >= p->text_start && va < p->text_end) {
+      printf("[pid %d] KILL write-to-text va=0x%lx\n", p->pid, va);
       setkilled(p);
       return;
     }

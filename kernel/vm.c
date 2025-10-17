@@ -542,11 +542,15 @@ handle_exec_fault(uint64 va)
   if (mem == 0) {
     // Memory full - trigger page replacement (Phase 3)
     if(handle_page_replacement() < 0) {
-      panic("handle_exec_fault: page replacement failed");
+      // Process was killed due to swap exhaustion or other error
+      return;
     }
     mem = kalloc();
     if(mem == 0) {
-      panic("handle_exec_fault: kalloc failed after replacement");
+      // Still no memory after replacement - kill process
+      printf("[pid %d] KILL memory-exhausted\n", p->pid);
+      setkilled(p);
+      return;
     }
   }
   
@@ -662,11 +666,15 @@ handle_heap_fault(uint64 va)
   if (mem == 0) {
     // Memory full - trigger page replacement (Phase 3)
     if(handle_page_replacement() < 0) {
-      panic("handle_heap_fault: page replacement failed");
+      // Process was killed due to swap exhaustion or other error
+      return;
     }
     mem = kalloc();
     if(mem == 0) {
-      panic("handle_heap_fault: kalloc failed after replacement");
+      // Still no memory after replacement - kill process
+      printf("[pid %d] KILL memory-exhausted\n", p->pid);
+      setkilled(p);
+      return;
     }
   }
   
@@ -895,11 +903,15 @@ handle_swap_fault(uint64 va)
   if (mem == 0) {
     // Memory full - trigger page replacement
     if(handle_page_replacement() < 0) {
-      panic("handle_swap_fault: page replacement failed");
+      // Process was killed due to swap exhaustion or other error
+      return;
     }
     mem = kalloc();
     if(mem == 0) {
-      panic("handle_swap_fault: kalloc failed after replacement");
+      // Still no memory after replacement - kill process
+      printf("[pid %d] KILL memory-exhausted\n", p->pid);
+      setkilled(p);
+      return;
     }
   }
   
@@ -939,48 +951,73 @@ handle_page_replacement(void)
   struct proc *p = myproc();
   pte_t *pte;
   uint64 pa;
+  uint64 victim_va;
+  int idx;
+  uint victim_seq;
+  int is_dirty;
+  const char *algo_name;
+  int attempts = 0;
+  const int MAX_ATTEMPTS = 10;  // Prevent infinite loops
   
   // Log memory full
   printf("[pid %d] MEMFULL\n", p->pid);
   
-  // Check if there are any resident pages to evict
-  if (p->num_resident == 0) {
-    printf("[pid %d] KILL no-pages-to-evict\n", p->pid);
+  // Loop to find a valid victim page
+  while (attempts < MAX_ATTEMPTS) {
+    // Check if there are any resident pages to evict
+    if (p->num_resident == 0) {
+      printf("[pid %d] KILL no-pages-to-evict\n", p->pid);
+      setkilled(p);
+      return -1;
+    }
+    
+    // Select victim using configured algorithm
+#ifdef USE_CLOCK_ALGORITHM
+    victim_va = select_clock_victim(p);
+    algo_name = "CLOCK";
+#else
+    victim_va = select_fifo_victim(p);
+    algo_name = "FIFO";
+#endif
+    
+    // Find victim in resident set to get its metadata
+    if (!find_resident_page(p, victim_va, &idx)) {
+      panic("handle_page_replacement: victim not in resident set");
+    }
+    
+    victim_seq = p->resident_pages[idx].seq;
+    is_dirty = p->resident_pages[idx].is_dirty;
+    
+    // Log victim selection
+    printf("[pid %d] VICTIM va=0x%lx seq=%d algo=%s\n",
+           p->pid, victim_va, victim_seq, algo_name);
+    
+    // Log eviction with state
+    printf("[pid %d] EVICT va=0x%lx state=%s\n",
+           p->pid, victim_va, is_dirty ? "dirty" : "clean");
+    
+    // Get PTE and physical address before eviction
+    pte = walk(p->pagetable, victim_va, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0) {
+      // Page is not valid - already evicted or never allocated
+      // Just remove from resident set and try next victim
+      printf("[pid %d] WARNING: victim page 0x%lx not valid, removing from resident set\n", p->pid, victim_va);
+      remove_from_resident_set(p, victim_va);
+      attempts++;
+      continue;  // Try next victim
+    }
+    
+    // Found a valid victim, break out of loop
+    break;
+  }
+  
+  // Check if we exhausted attempts
+  if (attempts >= MAX_ATTEMPTS) {
+    printf("[pid %d] KILL too-many-invalid-victims\n", p->pid);
     setkilled(p);
     return -1;
   }
   
-  // Select victim using configured algorithm
-#ifdef USE_CLOCK_ALGORITHM
-  uint64 victim_va = select_clock_victim(p);
-  const char *algo_name = "CLOCK";
-#else
-  uint64 victim_va = select_fifo_victim(p);
-  const char *algo_name = "FIFO";
-#endif
-  
-  // Find victim in resident set to get its metadata
-  int idx;
-  if (!find_resident_page(p, victim_va, &idx)) {
-    panic("handle_page_replacement: victim not in resident set");
-  }
-  
-  uint victim_seq = p->resident_pages[idx].seq;
-  int is_dirty = p->resident_pages[idx].is_dirty;
-  
-  // Log victim selection
-  printf("[pid %d] VICTIM va=0x%lx seq=%d algo=%s\n",
-         p->pid, victim_va, victim_seq, algo_name);
-  
-  // Log eviction with state
-  printf("[pid %d] EVICT va=0x%lx state=%s\n",
-         p->pid, victim_va, is_dirty ? "dirty" : "clean");
-  
-  // Get PTE and physical address before eviction
-  pte = walk(p->pagetable, victim_va, 0);
-  if (pte == 0 || (*pte & PTE_V) == 0) {
-    panic("handle_page_replacement: victim page not valid");
-  }
   pa = PTE2PA(*pte);
   
   // Handle eviction based on dirty state
