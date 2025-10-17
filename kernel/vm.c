@@ -205,6 +205,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
+  struct proc *p = myproc();
 
   if((va % PGSIZE) != 0)
     panic("uvmunmap: not aligned");
@@ -212,11 +213,23 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
       continue;   
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
+    if((*pte & PTE_V) == 0) {  // has physical page been allocated?
+      // Check if it's a swapped page and free the swap slot
+      if (p && (*pte & PTE_SWAPPED)) {
+        int slot = (*pte >> 10) & 0x3FF;  // Extract slot number
+        free_swap_slot(p, slot);
+        *pte = 0;
+      }
       continue;
+    }
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
+      
+      // Remove from resident set if this is the current process
+      if (p && p->pagetable == pagetable) {
+        remove_from_resident_set(p, a);
+      }
     }
     *pte = 0;
   }

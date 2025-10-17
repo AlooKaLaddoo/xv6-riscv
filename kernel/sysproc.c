@@ -42,8 +42,10 @@ sys_sbrk(void)
 {
   uint64 addr;
   int n;
+  int flags;
 
   argint(0, &n);
+  argint(1, &flags);  // SBRK_EAGER or SBRK_LAZY (we ignore this - always lazy)
   addr = myproc()->sz;
 
   // Always use lazy allocation through growproc()

@@ -264,7 +264,12 @@ growproc(int n)
     }
   } else if(n < 0){
     // Heap shrinking - free pages and update swap
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    // Don't allow shrinking below heap_start (would free text/data)
+    uint64 newsz = sz + n;
+    if (newsz < p->heap_start) {
+      newsz = p->heap_start;
+    }
+    sz = uvmdealloc(p->pagetable, sz, newsz);
   }
   p->sz = sz;
   return 0;

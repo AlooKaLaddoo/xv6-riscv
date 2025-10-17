@@ -12,5 +12,5 @@
 #define FSSIZE       2000  // size of file system in blocks
 #define MAXPATH      128   // maximum file path name
 #define USERSTACK    1     // user stack pages
-#define MAXPROCSIZE  (200*1024*1024) // max process virtual memory size (200MB)
+#define MAXPROCSIZE  (2UL*1024*1024*1024) // max process virtual memory size (2GB)
 
